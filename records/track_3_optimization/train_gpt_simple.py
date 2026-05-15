@@ -575,6 +575,418 @@ class SinkSOAP(torch.optim.Optimizer):
                     )
 
 
+
+
+
+@torch.compile
+def compressed_sinkhorn_coeffs(
+    A11,      # [..., r_o, r_u]
+    s12,      # [..., r_o]
+    s21,      # [..., r_u]
+    S22,      # [...] or [..., 1, 1]
+    m: int,
+    n: int,
+    steps: int = 10,
+    gamma: float = 1.0,
+    eps: float = 1e-10,
+):
+    """
+    Compressed Sinkhorn on energy matrix:
+
+        C = [[A11^2, s12],
+             [s21^T, S22]]
+
+    Returns coefficients for update A, not energy:
+        rt = x_top^(gamma/2)
+        ct = y_top^(gamma/2)
+        r0 = x_res^(gamma/2)
+        c0 = y_res^(gamma/2)
+    """
+    B11 = A11.square()
+
+    *batch, ro, ru = A11.shape
+    device = A11.device
+    dtype = A11.dtype
+
+    S22 = S22.reshape(*batch, 1, 1)
+
+    top = torch.cat(
+        [B11, s12.unsqueeze(-1)],
+        dim=-1,
+    )  # [..., ro, ru + 1]
+
+    bottom = torch.cat(
+        [s21.unsqueeze(-2), S22],
+        dim=-1,
+    )  # [..., 1, ru + 1]
+
+    C = torch.cat([top, bottom], dim=-2).clamp_min(eps)
+    # [..., ro + 1, ru + 1]
+
+    # Dimension-proportional marginals.
+    a = torch.empty(ro + 1, device=device, dtype=dtype)
+    a[:ro] = 1.0 / m
+    a[ro] = max(m - ro, 0) / m
+
+    b = torch.empty(ru + 1, device=device, dtype=dtype)
+    b[:ru] = 1.0 / n
+    b[ru] = max(n - ru, 0) / n
+
+    x = torch.ones(*batch, ro + 1, device=device, dtype=dtype)
+    y = torch.ones(*batch, ru + 1, device=device, dtype=dtype)
+
+    for _ in range(steps):
+        x = a / ((C @ y.unsqueeze(-1)).squeeze(-1) + eps)
+        y = b / ((C.transpose(-2, -1) @ x.unsqueeze(-1)).squeeze(-1) + eps)
+
+    # No coefficient clipping.
+    x = x.clamp_min(eps).pow(gamma / 2)
+    y = y.clamp_min(eps).pow(gamma / 2)
+
+    rt = x[..., :ro]
+    r0 = x[..., ro]
+
+    ct = y[..., :ru]
+    c0 = y[..., ru]
+
+    return rt, ct, r0, c0
+
+
+@torch.compile
+def cosmos_normuon_update(
+    grad,
+    momentum,
+    second_momentum,
+    U,
+    O,
+    S,
+    R,
+    step,
+    mu=0.95,
+    beta2=0.95,
+    eps=1e-10,
+    nesterov=True,
+):
+    # ------------------------------------------------------------------
+    # Original Normuon momentum
+    # ------------------------------------------------------------------
+    momentum.lerp_(grad, 1 - mu)
+    M_hat = grad.lerp(momentum, mu) if nesterov else momentum
+
+    G = grad.float()
+    M_hat = M_hat.float()
+
+    U_f = U.float()  # n x r_u
+    O_f = O.float()  # m x r_o
+    S_f = S.float()  # r_u x r_u
+    R_f = R.float()  # r_o x r_o
+
+    m = grad.size(-2)
+    n = grad.size(-1)
+
+    # ------------------------------------------------------------------
+    # COSMOS subspace update, allowing rank_o != rank_u
+    # ------------------------------------------------------------------
+
+    # U_t <- QR(beta2 U_{t-1} S_{t-1}
+    #           + (1-beta2) G_t^T G_t U_{t-1})
+    GU = G @ U_f
+    U_new, _ = torch.linalg.qr(
+        beta2 * (U_f @ S_f)
+        + (1 - beta2) * (G.transpose(-2, -1) @ GU),
+        mode="reduced",
+    )
+
+    # O_t <- QR(beta2 O_{t-1} R_{t-1}
+    #           + (1-beta2) G_t G_t^T O_{t-1})
+    GtO = G.transpose(-2, -1) @ O_f
+    O_new, _ = torch.linalg.qr(
+        beta2 * (O_f @ R_f)
+        + (1 - beta2) * (G @ GtO),
+        mode="reduced",
+    )
+
+    # S_t <- U_t^T (beta2 U S U^T + (1-beta2) G^T G) U_t
+    U_old_T_U_new = U_f.transpose(-2, -1) @ U_new
+    G_U_new = G @ U_new
+    S_new = (
+        beta2 * (U_new.transpose(-2, -1) @ U_f @ S_f @ U_old_T_U_new)
+        + (1 - beta2) * (G_U_new.transpose(-2, -1) @ G_U_new)
+    )
+
+    # R_t <- O_t^T (beta2 O R O^T + (1-beta2) G G^T) O_t
+    O_old_T_O_new = O_f.transpose(-2, -1) @ O_new
+    Gt_O_new = G.transpose(-2, -1) @ O_new
+    R_new = (
+        beta2 * (O_new.transpose(-2, -1) @ O_f @ R_f @ O_old_T_O_new)
+        + (1 - beta2) * (Gt_O_new.transpose(-2, -1) @ Gt_O_new)
+    )
+
+
+    # ------------------------------------------------------------------
+    # Top-left COSMOS branch
+    # ------------------------------------------------------------------
+    A_core = O_new.transpose(-2, -1) @ M_hat @ U_new  # r_o x r_u
+
+    # ------------------------------------------------------------------
+    # Bottom-left branch: (I - OO^T) M U
+    # ------------------------------------------------------------------
+
+    # n0 = ||M_hat U U^T||_F = ||M_hat U||_F
+    M_U = M_hat @ U_new  # m x r_u
+    norm0 = M_U.norm(dim=(-2, -1), keepdim=True)
+    
+
+    O_T_M_U = O_new.transpose(-2, -1) @ M_U
+    Y_U  = M_U - O_new @ O_T_M_U  # m x r_u
+
+    # ------------------------------------------------------------------
+    # Compressed Sinkhorn block statistics
+    # ------------------------------------------------------------------
+
+    # O^T M, shape r_o x n
+    O_T_M = O_new.transpose(-2, -1) @ M_hat
+
+    # Raw top-left coordinate of momentum
+    O_T_M_U = O_T_M @ U_new
+
+    # Top-right:
+    # A12 = O^T M (I - U U^T)
+    A12_ambient = O_T_M - O_T_M_U @ U_new.transpose(-2, -1)
+    s12 = A12_ambient.square().sum(dim=-1)  # r_o
+
+    # Bottom-left:
+    # Use preconditioned residual candidate Y_U.
+    s21 = Y_U.square().sum(dim=-2)  # r_u
+
+    # Bottom-right:
+    # M22 = (I - OO^T) M (I - UU^T)
+    M_right_top = M_U @ U_new.transpose(-2, -1)
+    M_left_top = O_new @ O_T_M
+    M_top_top = O_new @ O_T_M_U @ U_new.transpose(-2, -1)
+
+    M22 = M_hat - M_left_top - M_right_top + M_top_top
+    S22 = M22.square().sum(dim=(-2, -1))
+
+    rt, ct, r0, c0 = compressed_sinkhorn_coeffs(
+        A11=A_core,
+        s12=s12,
+        s21=s21,
+        S22=S22,
+        m=m,
+        n=n,
+        steps=10,
+        gamma=1.0,
+        eps=eps,
+    )
+
+    # ------------------------------------------------------------------
+    # Build balanced four-block update
+    # ------------------------------------------------------------------
+
+    # Top-left block
+    A11_bal = rt.unsqueeze(-1) * A_core * ct.unsqueeze(-2)
+    update_11 = O_new @ A11_bal @ U_new.transpose(-2, -1)
+
+    # Top-right block
+    A12_bal = rt.unsqueeze(-1) * A12_ambient * c0.unsqueeze(-1).unsqueeze(-1)
+    update_12 = O_new @ A12_bal
+
+    # Bottom-left block
+    A21_bal = r0.unsqueeze(-1).unsqueeze(-1) * Y_U * ct.unsqueeze(-2)
+    update_21 = A21_bal @ U_new.transpose(-2, -1)
+
+    # Bottom-right block:
+    # Muon on M22, rescale back to original M22 norm,
+    # then multiply sqrt(x0 y0) = r0 * c0.
+    update_22 = zeropower_via_newtonschulz5(M22).float()
+
+    M22_norm = M22.norm(dim=(-2, -1), keepdim=True)
+    update_22 = update_22 * (
+        M22_norm / update_22.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    )
+
+    update_22 = (
+        update_22
+        * r0.unsqueeze(-1).unsqueeze(-1)
+        * c0.unsqueeze(-1).unsqueeze(-1)
+    )
+
+    update = update_11 + update_12 + update_21 + update_22
+
+    # ------------------------------------------------------------------
+    # Final Muon-level norm
+    #
+    # Target:
+    #   sqrt(max(1, m/n) * min(m, n))
+    # ------------------------------------------------------------------
+    muon_norm = (max(1.0, m / n) * min(m, n)) ** 0.5
+
+
+    update = update * (
+        muon_norm / update.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    )
+
+    # ------------------------------------------------------------------
+    # Normuon second-order branch only for rectangular matrices
+    # ------------------------------------------------------------------
+    if m != n:
+        norm = update.norm(dim=(-2, -1), keepdim=True)
+
+        v_mean = (
+            torch.mean(update * update, dim=-1, keepdim=True)
+            if m >= n
+            else torch.mean(update * update, dim=-2, keepdim=True)
+        )
+
+        second_momentum.lerp_(v_mean, 1 - beta2)
+
+        step_size = 1 / second_momentum.sqrt().clamp_min(eps)
+        update.mul_(step_size)
+
+        norm_new = update.norm(dim=(-2, -1), keepdim=True)
+        update.mul_(norm / norm_new.clamp_min(eps))
+
+       
+
+    update = update.bfloat16()
+
+    # Write COSMOS states back in-place
+    U.copy_(U_new)
+    O.copy_(O_new)
+    S.copy_(S_new)
+    R.copy_(R_new)
+
+    return update
+
+
+class COSMOS(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr=0.02,
+        weight_decay=0,
+        mu=0.95,
+        beta2=0.95,
+        rank_o=256,
+        rank_u=256,
+    ):
+        assert (
+            isinstance(params, list)
+            and len(params) >= 1
+            and isinstance(params[0], torch.nn.Parameter)
+        )
+
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+
+        defaults = dict(
+            lr=lr,
+            weight_decay=weight_decay,
+            mu=mu,
+            beta2=beta2,
+            rank_o=rank_o,
+            rank_u=rank_u,
+        )
+
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        rank_id = dist.get_rank()
+
+        for group in self.param_groups:
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (
+                world_size - len(params) % world_size
+            )
+
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank_id < len(params):
+                    p = params[base_i + rank_id]
+
+                    if p.grad is None:
+                        dist.all_gather(
+                            params_pad[base_i:base_i + world_size],
+                            params_pad[base_i + rank_id],
+                        )
+                        continue
+
+                    state = self.state[p]
+
+                    if len(state) == 0:
+                        m = p.size(-2)
+                        n = p.size(-1)
+
+                        rank_o = min(group["rank_o"], m)
+                        rank_u = min(group["rank_u"], n)
+
+                        state["momentum"] = torch.zeros_like(p)
+
+                        # Normuon second_momentum shape.
+                        # It is only used for m != n, but keeping allocation simple.
+                        state["second_momentum"] = (
+                            torch.zeros_like(p.data[..., 0:1])
+                            if m >= n
+                            else torch.zeros_like(p.data[0:1, ...])
+                        )
+
+                        # First step: initialize O and U from SVD of G.
+                        # O: m x rank_o
+                        # U: n x rank_u
+                        G0 = p.grad.float()
+                        O0, _, Vh0 = torch.linalg.svd(G0, full_matrices=False)
+
+                        state["O"] = O0[..., :, :rank_o].contiguous()
+                        state["U"] = Vh0.transpose(-2, -1)[..., :, :rank_u].contiguous()
+
+                        state["S"] = torch.zeros(
+                            *p.shape[:-2],
+                            rank_u,
+                            rank_u,
+                            device=p.device,
+                            dtype=torch.float32,
+                        )
+
+                        state["R"] = torch.zeros(
+                            *p.shape[:-2],
+                            rank_o,
+                            rank_o,
+                            device=p.device,
+                            dtype=torch.float32,
+                        )
+
+                        state["step"] = torch.zeros(
+                            (),
+                            device=p.device,
+                            dtype=torch.float32,
+                        )
+
+                    state["step"].add_(1.0)
+
+                    update = cosmos_normuon_update(
+                        p.grad,
+                        state["momentum"],
+                        state["second_momentum"],
+                        state["U"],
+                        state["O"],
+                        state["S"],
+                        state["R"],
+                        state["step"],
+                        mu=group["mu"],
+                        beta2=group["beta2"],
+                    )
+
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+
+                dist.all_gather(
+                    params_pad[base_i:base_i + world_size],
+                    params_pad[base_i + rank_id],
+                )
+
+
+
 ########################################
 #                Setup                 #
 ########################################
@@ -626,7 +1038,7 @@ for _ in range(num_trials):
     ########################################
 
     # we want to minimize this while still reaching 3.28 val loss
-    train_steps = 3125
+    train_steps = 3225
 
     # initialize model parameters
     for name, p in model.named_parameters():
@@ -650,7 +1062,7 @@ for _ in range(num_trials):
                         dict(params=[model.proj.weight], lr=1/320),
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
                        betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
-    optimizer2 = SinkSOAP([p for p in model.blocks.parameters() if p.ndim >= 2],
+    optimizer2 = COSMOS([p for p in model.blocks.parameters() if p.ndim >= 2],
                       lr=0.04, weight_decay=0.025)
     optimizers = [optimizer1, optimizer2]
     assert set(p for opt in optimizers for group in opt.param_groups
@@ -687,8 +1099,8 @@ for _ in range(num_trials):
     for step in range(train_steps + 1):
 
         # --------------- VALIDATION SECTION -----------------
-        val_step_freq = 125 if step / train_steps < 0.94 else 25
-        if step == train_steps or step % val_step_freq == 0 or step == 3080 or step == 3085 or step == 3090:
+        val_step_freq = 125 if step / train_steps < 0.9 else 25
+        if step == train_steps or step % val_step_freq == 0:
             # stop the clock
             dist.barrier()
             time_since_last_val = time.perf_counter() - t0
